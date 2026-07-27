@@ -70,31 +70,60 @@ jobs:
         shell: pwsh
         run: |
           $novncPath = "$PWD\novnc"
+          Write-Host "noVNC path: $novncPath"
           
           # Start websockify: serves noVNC web files on :8080, proxies websockets to TightVNC :5900
           Start-Process -FilePath "python" -ArgumentList "-m", "websockify", "--web", $novncPath, "8080", "localhost:5900" -WindowStyle Hidden
           Write-Host "websockify started on port 8080"
           Start-Sleep -Seconds 5
           
-          # Start Cloudflare ephemeral tunnel (no account/domain needed)
-          Start-Process -FilePath ".\cloudflared.exe" -ArgumentList "tunnel", "--url", "http://localhost:8080", "--no-autoupdate" -RedirectStandardOutput "cf.log" -WindowStyle Hidden
-          Write-Host "Cloudflare tunnel starting..."
-          Start-Sleep -Seconds 20
+          # Verify websockify is listening
+          $listener = Get-NetTCPConnection -LocalPort 8080 -ErrorAction SilentlyContinue
+          if (-not $listener) {
+            Write-Warning "Port 8080 not listening yet, waiting more..."
+            Start-Sleep -Seconds 5
+          }
           
-          # Extract the public URL from logs
+          # Start Cloudflare ephemeral tunnel (no account/domain needed)
+          # Redirect BOTH stdout and stderr to capture the URL
+          Start-Process -FilePath ".\cloudflared.exe" -ArgumentList "tunnel", "--url", "http://localhost:8080", "--no-autoupdate" -RedirectStandardOutput "cf-out.log" -RedirectStandardError "cf-err.log" -WindowStyle Hidden
+          Write-Host "Cloudflare tunnel starting..."
+          Start-Sleep -Seconds 25
+          
+          # Try to extract the public URL from logs with retries
           $url = $null
-          for ($i = 0; $i -lt 10; $i++) {
-            $log = Get-Content "cf.log" -ErrorAction SilentlyContinue | Out-String
-            if ($log -match "(https://[a-z0-9-]+\.trycloudflare\.com)") {
-              $url = $matches[1]
-              break
+          for ($i = 0; $i -lt 15; $i++) {
+            $outLog = Get-Content "cf-out.log" -ErrorAction SilentlyContinue | Out-String
+            $errLog = Get-Content "cf-err.log" -ErrorAction SilentlyContinue | Out-String
+            
+            # Try multiple patterns - cloudflared may output URL differently
+            foreach ($log in @($outLog, $errLog)) {
+              if ($log -match "(https://[a-zA-Z0-9-]+\.trycloudflare\.com)") {
+                $url = $matches[1]
+                break
+              }
+              # Sometimes URL appears without https:// in logs
+              if ($log -match "(https?://[a-zA-Z0-9-]+\.trycloudflare\.com)") {
+                $url = $matches[1]
+                break
+              }
             }
-            Start-Sleep -Seconds 2
+            
+            if ($url) { break }
+            
+            Write-Host "Attempt $($i+1)/15 - URL not found yet, waiting..."
+            Start-Sleep -Seconds 3
           }
           
           if (-not $url) {
+            Write-Host ""
+            Write-Host "=== CLOUDFLARED STDOUT ==="
+            Get-Content "cf-out.log" -ErrorAction SilentlyContinue
+            Write-Host ""
+            Write-Host "=== CLOUDFLARED STDERR ==="
+            Get-Content "cf-err.log" -ErrorAction SilentlyContinue
+            Write-Host ""
             Write-Error "Failed to get Cloudflare tunnel URL!"
-            Get-Content "cf.log" -ErrorAction SilentlyContinue
             exit 1
           }
           
