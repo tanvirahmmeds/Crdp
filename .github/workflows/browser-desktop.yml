@@ -27,15 +27,26 @@ jobs:
             SERVER_ADD_FIREWALL_EXCEPTION=1 `
             SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 `
             SET_PASSWORD=1 VALUE_OF_PASSWORD=$pass
+          Start-Sleep -Seconds 10
 
       - name: Start TightVNC Service
         shell: pwsh
         run: |
-          Start-Sleep -Seconds 5
-          Start-Service tvnserver -ErrorAction SilentlyContinue
-          net start tvnserver 2>$null
-          Write-Host "TightVNC service status:"
-          Get-Service tvnserver | Select-Object Name, Status
+          $svc = Get-Service tvnserver -ErrorAction SilentlyContinue
+          if (-not $svc) {
+            Write-Error "TightVNC service not found!"
+            exit 1
+          }
+          if ($svc.Status -ne 'Running') {
+            Start-Service tvnserver
+            Start-Sleep -Seconds 3
+          }
+          $svc = Get-Service tvnserver
+          Write-Host "TightVNC service status: $($svc.Status)"
+          if ($svc.Status -ne 'Running') {
+            Write-Error "Failed to start TightVNC service!"
+            exit 1
+          }
 
       - name: Download noVNC
         shell: pwsh
@@ -47,8 +58,7 @@ jobs:
 
       - name: Install websockify
         shell: pwsh
-        run: |
-          pip install websockify
+        run: pip install websockify
 
       - name: Download cloudflared
         shell: pwsh
@@ -64,20 +74,28 @@ jobs:
           # Start websockify: serves noVNC web files on :8080, proxies websockets to TightVNC :5900
           Start-Process -FilePath "python" -ArgumentList "-m", "websockify", "--web", $novncPath, "8080", "localhost:5900" -WindowStyle Hidden
           Write-Host "websockify started on port 8080"
-          Start-Sleep -Seconds 3
+          Start-Sleep -Seconds 5
           
           # Start Cloudflare ephemeral tunnel (no account/domain needed)
           Start-Process -FilePath ".\cloudflared.exe" -ArgumentList "tunnel", "--url", "http://localhost:8080", "--no-autoupdate" -RedirectStandardOutput "cf.log" -WindowStyle Hidden
           Write-Host "Cloudflare tunnel starting..."
-          Start-Sleep -Seconds 15
+          Start-Sleep -Seconds 20
           
           # Extract the public URL from logs
-          $log = Get-Content "cf.log" -Raw -ErrorAction SilentlyContinue
-          if ($log -match "https://[a-z0-9-]+\.trycloudflare\.com") {
-            $url = $matches[0]
-          } else {
-            # Fallback: read line by line
-            $url = (Get-Content "cf.log" | Select-String -Pattern "https://.*trycloudflare.com" | Select-Object -First 1).Line.Trim()
+          $url = $null
+          for ($i = 0; $i -lt 10; $i++) {
+            $log = Get-Content "cf.log" -ErrorAction SilentlyContinue | Out-String
+            if ($log -match "(https://[a-z0-9-]+\.trycloudflare\.com)") {
+              $url = $matches[1]
+              break
+            }
+            Start-Sleep -Seconds 2
+          }
+          
+          if (-not $url) {
+            Write-Error "Failed to get Cloudflare tunnel URL!"
+            Get-Content "cf.log" -ErrorAction SilentlyContinue
+            exit 1
           }
           
           Write-Host ""
@@ -86,14 +104,12 @@ jobs:
           Write-Host "╠════════════════════════════════════════════════════════════╣"
           Write-Host "║  URL:      $url/vnc.html"
           Write-Host "║  Password: ${{ secrets.VNC_PASSWORD }}  (max 8 chars used)"
-          Write-Host "║  User:     (none — VNC uses password only)"
           Write-Host "╚════════════════════════════════════════════════════════════╝"
           Write-Host ""
           Write-Host "Steps to connect:"
           Write-Host "  1. Open the URL above in any browser"
           Write-Host "  2. Click 'Connect'"
           Write-Host "  3. Enter the password when prompted"
-          Write-Host "  4. You now have full Windows desktop control"
           Write-Host ""
           
           # Keep the job alive for 6 hours max
@@ -101,4 +117,3 @@ jobs:
             Start-Sleep -Seconds 60
             Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session active... ($i min / 360 max)"
           }
-          
